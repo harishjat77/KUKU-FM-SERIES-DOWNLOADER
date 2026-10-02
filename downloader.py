@@ -1,4 +1,3 @@
-import json
 import os
 import re
 import subprocess
@@ -9,20 +8,26 @@ import requests
 
 USER_AGENT = os.getenv(
     "USER_AGENT",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/149 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153 Safari/537.36",
 )
 FFMPEG_PATH = os.getenv("FFMPEG_PATH", "ffmpeg")
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "30"))
 
+HEADERS = {
+    "User-Agent": USER_AGENT,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Origin": "https://kukufm.com",
+    "Referer": "https://kukufm.com/",
+    "package-name": "com.vlv.web",
+    "preferred-lang": "hindi",
+    "x-source-service": "nodejs-web",
+}
+
 
 def build_session():
     session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": USER_AGENT,
-            "Accept-Language": "hi-IN,hi;q=0.9,en;q=0.8",
-        }
-    )
+    session.headers.update(HEADERS)
     return session
 
 
@@ -31,125 +36,140 @@ def sanitize_name(name):
     return cleaned[:160] or "episode"
 
 
-def get_show_id(url):
+def get_show_slug(url):
     parsed = urlparse(url.strip())
-    if parsed.netloc not in {"kukufm.com", "www.kukufm.com"}:
-        raise ValueError("Please send a valid KukuFM show URL.")
-
-    parts = parsed.path.strip("/").split("/")
+    if parsed.scheme != "https" or parsed.netloc not in {"kukufm.com", "www.kukufm.com"}:
+        raise ValueError("Invalid URL. Use: https://kukufm.com/show/<show-slug>")
+    parts = [p for p in parsed.path.split("/") if p]
     if len(parts) != 2 or parts[0] != "show" or not parts[1]:
-        raise ValueError("Please send a KukuFM /show/<slug> URL.")
-
+        raise ValueError("Invalid URL. Use: https://kukufm.com/show/<show-slug>")
+    if parsed.query or parsed.fragment:
+        raise ValueError("Invalid URL. Send the clean show URL only.")
     return parts[1]
 
 
-def _extract_initial_data(text):
-    marker = '"initialData":'
-    start = text.find(marker)
-    if start == -1:
-        raise RuntimeError("Show response did not contain initialData.")
-
-    start += len(marker)
-    decoder = json.JSONDecoder()
-    try:
-        data, _ = decoder.raw_decode(text[start:])
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Could not parse initialData from the show response.") from exc
-
-    if not isinstance(data, dict):
-        raise RuntimeError("Invalid initialData format returned by KukuFM.")
-    return data
-
-
-def get_show_data(show_slug):
+def get_show_info(show_slug):
     session = build_session()
-    url = f"https://kukufm.com/show/{show_slug}"
-
-    try:
-        response = session.get(url, timeout=REQUEST_TIMEOUT)
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Show request failed: {exc}") from exc
-
-    initial_data = _extract_initial_data(response.text)
-    show = initial_data.get("show")
-    episodes = initial_data.get("episodes")
-
-    if not isinstance(show, dict):
-        raise RuntimeError("Show metadata was not found in the current response.")
-    if not isinstance(episodes, list):
-        raise RuntimeError("Episode list was not found in the current response.")
-
-    return show, episodes
+    response = session.get(
+        f"https://kukufm.com/api/v2.3/channels/{show_slug}/",
+        timeout=REQUEST_TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+    show_name = data.get("title") or data.get("name") or show_slug.replace("-", " ").title()
+    poster_url = (
+        data.get("image")
+        or data.get("image_url")
+        or data.get("cover")
+        or data.get("cover_image")
+        or data.get("thumbnail")
+    )
+    return {"name": show_name, "poster_url": poster_url, "raw": data}
 
 
 def get_all_episodes(show_slug):
-    _, episodes = get_show_data(show_slug)
-    return sorted(episodes, key=lambda item: item.get("index", 0))
+    session = build_session()
+    episodes = []
+    page = 1
+    while True:
+        response = session.get(
+            f"https://kukufm.com/api/v2.3/channels/{show_slug}/episodes/?page={page}",
+            timeout=REQUEST_TIMEOUT,
+        )
+        response.raise_for_status()
+        data = response.json()
+        page_episodes = data.get("episodes", [])
+        episodes.extend(page_episodes)
+        if not data.get("has_more", False):
+            break
+        page += 1
+    return episodes
 
 
-def _get_audio_source(episode):
-    content = episode.get("content") or {}
-
-    # Only use media that the response says this session may download.
-    if episode.get("canDownload") is not True:
+def download_poster(url, output_folder):
+    if not url:
         return None
+    output_folder = Path(output_folder)
+    path = output_folder / "cover.jpg"
+    response = build_session().get(url, timeout=REQUEST_TIMEOUT)
+    response.raise_for_status()
+    path.write_bytes(response.content)
+    return path
 
-    return content.get("premiumAudioUrl") or content.get("hlsUrl")
+
+def get_audio_source(episode):
+    content = episode.get("content") or {}
+    if episode.get("canDownload") is False:
+        return None
+    return (
+        content.get("premiumAudioUrl")
+        or content.get("hls_url")
+        or content.get("hlsUrl")
+    )
 
 
-def download_episode(episode, output_folder):
+def download_episode(episode, output_folder, poster_path=None):
     output_folder = Path(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
 
     ep_index = int(episode.get("index") or 0)
     ep_title = sanitize_name(episode.get("title") or f"Episode {ep_index}")
     final_path = output_folder / f"{ep_index:02d}. {ep_title}.m4a"
+    temp_path = output_folder / f".{ep_index:02d}.audio.m4a"
 
-    source_url = _get_audio_source(episode)
+    source_url = get_audio_source(episode)
     if not source_url:
-        raise RuntimeError(
-            f"{ep_title}: no permitted downloadable audio URL was returned."
-        )
+        raise RuntimeError(f"{ep_title}: no downloadable audio source returned.")
 
-    command = [
-        FFMPEG_PATH,
-        "-y",
-        "-user_agent",
-        USER_AGENT,
-        "-headers",
-        "Referer: https://kukufm.com/\\r\\nOrigin: https://kukufm.com\\r\\n",
-        "-i",
-        source_url,
-        "-map",
-        "0:a:0",
-        "-vn",
-        "-c:a",
-        "copy",
-        str(final_path),
+    headers = (
+        f"User-Agent: {USER_AGENT}\r\n"
+        "Origin: https://kukufm.com\r\n"
+        "Referer: https://kukufm.com/\r\n"
+        "Accept: */*\r\n"
+    )
+
+    base_cmd = [
+        FFMPEG_PATH, "-y", "-headers", headers, "-i", source_url,
+        "-map", "0:a:0", "-vn", "-c:a", "copy", "-bsf:a", "aac_adtstoasc",
+        str(temp_path),
     ]
+    _run_ffmpeg(base_cmd, ep_title)
 
     try:
-        result = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=60 * 30,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"FFmpeg was not found at: {FFMPEG_PATH}") from exc
-    except subprocess.TimeoutExpired as exc:
+        if poster_path and Path(poster_path).exists():
+            cover_cmd = [
+                FFMPEG_PATH, "-y",
+                "-i", str(temp_path),
+                "-i", str(poster_path),
+                "-map", "0:a:0", "-map", "1:v:0",
+                "-c:a", "copy", "-c:v", "mjpeg",
+                "-disposition:v:0", "attached_pic",
+                "-metadata", f"title={ep_title}",
+                str(final_path),
+            ]
+            _run_ffmpeg(cover_cmd, ep_title)
+            temp_path.unlink(missing_ok=True)
+        else:
+            temp_path.replace(final_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
         final_path.unlink(missing_ok=True)
-        raise RuntimeError(f"{ep_title}: FFmpeg timed out.") from exc
-    except subprocess.CalledProcessError as exc:
-        final_path.unlink(missing_ok=True)
-        error = (exc.stderr or "").strip()
-        if len(error) > 700:
-            error = error[-700:]
-        raise RuntimeError(f"{ep_title}: FFmpeg failed. {error}") from exc
+        raise
 
     if not final_path.exists() or final_path.stat().st_size == 0:
         raise RuntimeError(f"{ep_title}: output file was not created.")
-
     return final_path
+
+
+def _run_ffmpeg(command, title):
+    try:
+        subprocess.run(
+            command, check=True, capture_output=True, text=True, timeout=60 * 60
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"FFmpeg not found: {FFMPEG_PATH}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{title}: FFmpeg timed out.") from exc
+    except subprocess.CalledProcessError as exc:
+        error = (exc.stderr or "")[-1000:]
+        raise RuntimeError(f"{title}: FFmpeg failed. {error}") from exc
