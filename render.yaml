@@ -6,7 +6,5 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: KUKU_GUEST_USER_ID
-        sync: false
-      - key: KUKU_JWT_TOKEN
-        sync: false
+      - key: REQUEST_TIMEOUT
+        value: "30"
