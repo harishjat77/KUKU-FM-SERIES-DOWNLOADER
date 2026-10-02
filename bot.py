@@ -50,11 +50,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Welcome to HB Audio Uploader!\n\n"
         "Available commands:\n"
-        "/HB — Start a new show download & upload\n"
+        "/hb — Start a new show download & upload\n"
         "/pause — Pause current job\n"
         "/resume — Resume paused job\n"
         "/stop — Stop current job\n\n"
-        "Use /HB and paste a clean show URL when asked."
+        "Use /hb and paste a clean show URL when asked."
     )
 
 
@@ -117,7 +117,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     if not context.user_data.get("awaiting_show_url"):
-        await update.message.reply_text("Use /HB first.")
+        await update.message.reply_text("Use /hb first.")
         return
 
     url = (update.message.text or "").strip()
@@ -241,10 +241,11 @@ async def process_show(update: Update, uid: int, slug: str):
 
 
 async def post_init(app):
+    # Telegram requires command names to be lowercase only
     await app.bot.set_my_commands(
         [
             BotCommand("start", "Welcome and commands"),
-            BotCommand("HB", "Start show download/upload"),
+            BotCommand("hb", "Start show download/upload"),
             BotCommand("pause", "Pause current job"),
             BotCommand("resume", "Resume paused job"),
             BotCommand("stop", "Stop current job"),
@@ -260,7 +261,8 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("HB", hb))
+    # Accept both /hb and /HB (Telegram normalizes; handler is case-insensitive)
+    app.add_handler(CommandHandler(["hb", "HB"], hb))
     app.add_handler(CommandHandler("pause", pause))
     app.add_handler(CommandHandler("resume", resume))
     app.add_handler(CommandHandler("stop", stop))
