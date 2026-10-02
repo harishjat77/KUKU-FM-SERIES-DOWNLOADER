@@ -5,53 +5,84 @@ import shutil
 import tempfile
 
 from telegram import Update
+from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
 from downloader import download_episode, get_all_episodes, get_show_id
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO,
+)
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send a KukuFM show URL. The bot will process permitted episodes as M4A audio."
+        "Send a KukuFM /show/<slug> URL. Permitted episodes will be processed "
+        "as M4A audio and sent here."
     )
 
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    url = (update.message.text or "").strip()
+    message = update.message
+    url = (message.text or "").strip()
     workdir = tempfile.mkdtemp(prefix="kuku_")
-    status = await update.message.reply_text("Checking series…")
+    status = await message.reply_text("Checking series…")
 
     try:
         show_slug = get_show_id(url)
         episodes = await asyncio.to_thread(get_all_episodes, show_slug)
-        await status.edit_text(
-            f"Found {len(episodes)} episodes. Starting M4A processing…"
-        )
 
-        completed = 0
-        failed = 0
+        if not episodes:
+            await status.edit_text("No episodes were found.")
+            return
 
-        for episode in episodes:
+        total = len(episodes)
+        await status.edit_text(f"Found {total} episodes. Starting M4A processing…")
+
+        sent = 0
+        skipped = 0
+
+        for position, episode in enumerate(episodes, start=1):
+            title = str(episode.get("title") or f"Episode {position}")
             try:
-                path = await asyncio.to_thread(download_episode, episode, workdir)
-                completed += 1
-                # Telegram upload is intentionally kept for the delivery phase.
-                path.unlink(missing_ok=True)
                 await status.edit_text(
-                    f"Processing series… {completed}/{len(episodes)} completed"
+                    f"Processing {position}/{total}\n{title}"
                 )
+                path = await asyncio.to_thread(download_episode, episode, workdir)
+
+                try:
+                    with path.open("rb") as audio_file:
+                        await message.reply_audio(
+                            audio=audio_file,
+                            title=title,
+                            filename=path.name,
+                            caption=f"{position}/{total} • {title}",
+                            read_timeout=300,
+                            write_timeout=300,
+                            connect_timeout=60,
+                            pool_timeout=60,
+                        )
+                    sent += 1
+                finally:
+                    path.unlink(missing_ok=True)
+
+            except TelegramError as exc:
+                logging.exception("Telegram upload failed")
+                skipped += 1
+                logging.warning("Upload skipped for %s: %s", title, exc)
             except Exception as exc:
                 logging.exception("Episode processing failed")
-                failed += 1
+                skipped += 1
                 logging.warning("Episode skipped: %s", exc)
 
         await status.edit_text(
-            f"Finished. Processed: {completed}, Failed/skipped: {failed}. "
-            "Telegram delivery will be added in the next phase."
+            f"Finished. Sent: {sent}/{total}. Failed/skipped: {skipped}."
         )
+
+    except ValueError as exc:
+        await status.edit_text(str(exc))
     except Exception as exc:
         logging.exception("Job failed")
         await status.edit_text(f"Error: {exc}")
