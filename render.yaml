@@ -2,7 +2,6 @@ services:
   - type: web
     name: hb-kuku-audio-bot
     runtime: docker
-    healthCheckPath: /
     autoDeploy: true
     envVars:
       - key: BOT_TOKEN
