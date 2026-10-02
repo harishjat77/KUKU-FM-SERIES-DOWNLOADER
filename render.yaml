@@ -1,10 +1,14 @@
 services:
   - type: worker
-    name: kuku-fm-series-bot
+    name: hb-kuku-audio-bot
     runtime: docker
     autoDeploy: true
     envVars:
       - key: BOT_TOKEN
+        sync: false
+      - key: TARGET_CHANNEL
+        sync: false
+      - key: OWNER_USER_ID
         sync: false
       - key: REQUEST_TIMEOUT
         value: "30"
