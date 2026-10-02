@@ -15,8 +15,7 @@ BOT_TOKEN = os.environ["BOT_TOKEN"]
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Send a KukuFM show URL. The bot will process the series. "
-        "Use this only for content you are authorized to download."
+        "Send a KukuFM show URL. The bot will process permitted episodes as M4A audio."
     )
 
 
@@ -26,27 +25,31 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status = await update.message.reply_text("Checking series…")
 
     try:
-        show_id = get_show_id(url)
-        episodes = await asyncio.to_thread(get_all_episodes, show_id)
-        await status.edit_text(f"Found {len(episodes)} episodes. Starting processing…")
+        show_slug = get_show_id(url)
+        episodes = await asyncio.to_thread(get_all_episodes, show_slug)
+        await status.edit_text(
+            f"Found {len(episodes)} episodes. Starting M4A processing…"
+        )
 
         completed = 0
         failed = 0
+
         for episode in episodes:
             try:
                 path = await asyncio.to_thread(download_episode, episode, workdir)
                 completed += 1
-                # Upload behavior will be expanded in the next phase.
+                # Telegram upload is intentionally kept for the delivery phase.
                 path.unlink(missing_ok=True)
                 await status.edit_text(
                     f"Processing series… {completed}/{len(episodes)} completed"
                 )
-            except Exception:
+            except Exception as exc:
                 logging.exception("Episode processing failed")
                 failed += 1
+                logging.warning("Episode skipped: %s", exc)
 
         await status.edit_text(
-            f"Finished. Processed: {completed}, Failed: {failed}. "
+            f"Finished. Processed: {completed}, Failed/skipped: {failed}. "
             "Telegram delivery will be added in the next phase."
         )
     except Exception as exc:
