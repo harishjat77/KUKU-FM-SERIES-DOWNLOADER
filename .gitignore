@@ -3,7 +3,8 @@ __pycache__/
 .env
 .venv/
 venv/
-Downloads/
 *.m4a
 *.mp3
-*.session
+*.mp4
+*.jpg
+*.jpeg
