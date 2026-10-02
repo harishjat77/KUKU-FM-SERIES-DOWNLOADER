@@ -157,6 +157,27 @@ async def process_show(update: Update, uid: int, slug: str):
             logging.exception("Poster download failed")
 
         total = len(episodes)
+
+        # Publish show details before any episode and pin them in the channel.
+        show_header = (
+            f"🎧 <b>{html.escape(show_name)}</b>\n"
+            f"📚 <b>Total Episodes:</b> {total}\n"
+            f"⏳ <b>Status:</b> Download & Upload Started"
+        )
+        try:
+            header_message = await update.get_bot().send_message(
+                chat_id=TARGET_CHANNEL,
+                text=show_header,
+                parse_mode=ParseMode.HTML,
+            )
+            await update.get_bot().pin_chat_message(
+                chat_id=TARGET_CHANNEL,
+                message_id=header_message.message_id,
+                disable_notification=True,
+            )
+        except TelegramError as exc:
+            logger.warning("Could not send/pin show header: %s", exc)
+
         await status.edit_text(
             f"🎧 {html.escape(show_name)}\nEpisodes: {total}\nStarting…"
         )
@@ -182,9 +203,9 @@ async def process_show(update: Update, uid: int, slug: str):
                 )
 
                 caption = (
-                    f"🎧 <b>“{html.escape(show_name)}”</b>\n\n"
                     f"🎙 <b>Episode {ep_no}</b>\n"
-                    f"📖 {html.escape(ep_name)}"
+                    f"📖 <b>{html.escape(ep_name)}</b>\n\n"
+                    f"<blockquote><b>{html.escape(show_name)}</b></blockquote>"
                 )
 
                 with audio_path.open("rb") as audio:
