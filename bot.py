@@ -9,7 +9,13 @@ from pathlib import Path
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 from downloader import (
     download_episode,
@@ -31,8 +37,10 @@ OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0") or 0)
 jobs = {}
 
 
-def allowed(update):
-    return not OWNER_USER_ID or (update.effective_user and update.effective_user.id == OWNER_USER_ID)
+def allowed(update: Update) -> bool:
+    if not OWNER_USER_ID:
+        return True
+    return bool(update.effective_user and update.effective_user.id == OWNER_USER_ID)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -40,12 +48,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     context.user_data["awaiting_show_url"] = False
     await update.message.reply_text(
-        "Welcome to HB Audio Uploader.\n\n"
-        "Commands:\n"
-        "/HB - Start a new show job\n"
-        "/pause - Pause current job\n"
-        "/resume - Resume paused job\n"
-        "/stop - Stop current job"
+        "👋 Welcome to HB Audio Uploader!\n\n"
+        "Available commands:\n"
+        "/HB — Start a new show download & upload\n"
+        "/pause — Pause current job\n"
+        "/resume — Resume paused job\n"
+        "/stop — Stop current job\n\n"
+        "Use /HB and paste a clean show URL when asked."
     )
 
 
@@ -55,11 +64,15 @@ async def hb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     active = jobs.get(uid)
     if active and not active.get("stopped"):
-        await update.message.reply_text("A job is already active. Use /stop first.")
+        await update.message.reply_text(
+            "A job is already active. Use /stop first."
+        )
         return
     context.user_data["awaiting_show_url"] = True
     await update.message.reply_text(
-        "Enter show URL:\nhttps://kukufm.com/show/<show-slug>"
+        "Enter show URL:\n"
+        "https://kukufm.com/show/<show-slug>\n\n"
+        "Example:\nhttps://kukufm.com/show/entrepreneur-5pm-to-9am-1"
     )
 
 
@@ -95,7 +108,9 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     job["stopped"] = True
     job["paused"] = False
-    await update.message.reply_text("⏹ Stop requested. Current step will finish, then the job will stop.")
+    await update.message.reply_text(
+        "⏹ Stop requested. Current step will finish, then the job will stop."
+    )
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -118,7 +133,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     asyncio.create_task(process_show(update, uid, slug))
 
 
-async def process_show(update, uid, slug):
+async def process_show(update: Update, uid: int, slug: str):
     job = jobs[uid]
     workdir = Path(tempfile.mkdtemp(prefix="hb_"))
     status = await update.message.reply_text("🔎 Reading show details…")
@@ -134,12 +149,16 @@ async def process_show(update, uid, slug):
 
         poster = None
         try:
-            poster = await asyncio.to_thread(download_poster, show.get("poster_url"), workdir)
+            poster = await asyncio.to_thread(
+                download_poster, show.get("poster_url"), workdir
+            )
         except Exception:
             logging.exception("Poster download failed")
 
         total = len(episodes)
-        await status.edit_text(f"🎧 {show_name}\nEpisodes: {total}\nStarting…")
+        await status.edit_text(
+            f"🎧 {html.escape(show_name)}\nEpisodes: {total}\nStarting…"
+        )
 
         sent = 0
         failed = 0
@@ -161,6 +180,7 @@ async def process_show(update, uid, slug):
                     download_episode, episode, workdir, poster
                 )
 
+                # Caption: show name bold + quotes, episode number + name
                 caption = (
                     f"🎧 <b>“{html.escape(show_name)}”</b>\n\n"
                     f"🎙 <b>Episode {ep_no}</b>\n"
@@ -168,7 +188,11 @@ async def process_show(update, uid, slug):
                 )
 
                 with audio_path.open("rb") as audio:
-                    thumb = poster.open("rb") if poster and poster.exists() else None
+                    thumb = (
+                        poster.open("rb")
+                        if poster and poster.exists()
+                        else None
+                    )
                     try:
                         await update.get_bot().send_audio(
                             chat_id=TARGET_CHANNEL,
@@ -217,23 +241,32 @@ async def process_show(update, uid, slug):
 
 
 async def post_init(app):
-    await app.bot.set_my_commands([
-        BotCommand("start", "Welcome and commands"),
-        BotCommand("HB", "Start show download/upload"),
-        BotCommand("pause", "Pause current job"),
-        BotCommand("resume", "Resume paused job"),
-        BotCommand("stop", "Stop current job"),
-    ])
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Welcome and commands"),
+            BotCommand("HB", "Start show download/upload"),
+            BotCommand("pause", "Pause current job"),
+            BotCommand("resume", "Resume paused job"),
+            BotCommand("stop", "Stop current job"),
+        ]
+    )
 
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("HB", hb))
     app.add_handler(CommandHandler("pause", pause))
     app.add_handler(CommandHandler("resume", resume))
     app.add_handler(CommandHandler("stop", stop))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(
+        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
+    )
     app.run_polling(drop_pending_updates=True)
 
 

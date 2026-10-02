@@ -12,3 +12,17 @@ services:
         sync: false
       - key: REQUEST_TIMEOUT
         value: "30"
+      - key: JWT_TOKEN
+        sync: false
+      - key: CLOUDFRONT_POLICY
+        sync: false
+      - key: CLOUDFRONT_SIGNATURE
+        sync: false
+      - key: CLOUDFRONT_KEY_PAIR_ID
+        sync: false
+      - key: GUEST_USER_ID
+        sync: false
+      - key: CLIENT_ID
+        sync: false
+      - key: PREFERRED_LANG
+        value: "hindi"
