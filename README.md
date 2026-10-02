@@ -1,28 +1,24 @@
-# KUKU-FM-SERIES-DOWNLOADER
+# HB Kuku Audio Uploader
 
-Telegram bot + KukuFM show parser prepared for Render.
+Telegram bot workflow for show URLs and authorized/downloadable audio.
 
-## Environment variables
+## Commands
 
-- `BOT_TOKEN` — Telegram BotFather token
-- `FFMPEG_PATH` — optional; defaults to `ffmpeg`
-- `USER_AGENT` — optional browser-style user agent
-- `REQUEST_TIMEOUT` — optional HTTP timeout in seconds; defaults to `30`
+- `/start` — welcome + command list
+- `/HB` — asks for a clean `https://kukufm.com/show/<show-slug>` URL
+- `/pause` — pause between episode steps
+- `/resume` — continue
+- `/stop` — stop after the current blocking step finishes
 
-Never commit authentication/session secrets to GitHub.
+## Render variables
 
-## Bot flow
+- `BOT_TOKEN` — Telegram bot token
+- `TARGET_CHANNEL` — target channel username (for example `@mychannel`) or numeric chat ID
+- `OWNER_USER_ID` — optional but recommended; only this Telegram user can control the bot
+- `REQUEST_TIMEOUT` — defaults to 30
 
-1. Start the bot with `/start`
-2. Send a valid `/show/<slug>` URL
-3. The current show response is parsed for `initialData.show` and `initialData.episodes`
-4. Episodes are sorted by their `index`
-5. Only media marked downloadable by the response is processed
-6. FFmpeg selects the audio stream and creates an `.m4a` file
-7. The bot sends the M4A as Telegram audio
-8. Each temporary file is deleted after upload and the job directory is removed at the end
-9. A final sent/failed summary is shown
+Add the bot as an administrator in the target channel with permission to post messages.
 
-The Dockerfile installs FFmpeg. `render.yaml` defines the bot as a Docker background worker.
+The bot validates the show URL, reads show metadata, downloads the poster when available, creates M4A audio with embedded cover art, and uploads each episode to the configured Telegram channel.
 
-Only process content you own or are authorized to download/distribute.
+Only use it for media you own or are authorized to download/distribute.
