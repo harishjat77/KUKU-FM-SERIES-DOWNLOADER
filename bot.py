@@ -256,8 +256,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def post_init(app: Application):
-    # Ensure no webhook is set (webhook + polling = conflict)
-    await app.bot.delete_webhook(drop_pending_updates=True)
+    # run_webhook/run_polling will configure the correct update transport.
     await app.bot.set_my_commands(
         [
             BotCommand("start", "Welcome and commands"),
@@ -286,10 +285,28 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
     app.add_error_handler(error_handler)
-    app.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=Update.ALL_TYPES,
-    )
+
+    # Render provides an external HTTPS URL to web services. Use Telegram
+    # webhooks there so no long-polling getUpdates process can conflict.
+    render_url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if render_url:
+        port = int(os.getenv("PORT", "10000"))
+        webhook_path = f"telegram/{BOT_TOKEN}"
+        logger.info("Starting in Render webhook mode on port %s", port)
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=port,
+            url_path=webhook_path,
+            webhook_url=f"{render_url}/{webhook_path}",
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    else:
+        logger.info("Starting in local polling mode")
+        app.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+        )
 
 
 if __name__ == "__main__":
