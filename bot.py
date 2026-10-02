@@ -1,99 +1,239 @@
 import asyncio
+import html
 import logging
 import os
 import shutil
 import tempfile
+from pathlib import Path
 
-from telegram import Update
+from telegram import BotCommand, Update
+from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 
-from downloader import download_episode, get_all_episodes, get_show_id
+from downloader import (
+    download_episode,
+    download_poster,
+    get_all_episodes,
+    get_show_info,
+    get_show_slug,
+)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]
+OWNER_USER_ID = int(os.getenv("OWNER_USER_ID", "0") or 0)
+
+jobs = {}
+
+
+def allowed(update):
+    return not OWNER_USER_ID or (update.effective_user and update.effective_user.id == OWNER_USER_ID)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    context.user_data["awaiting_show_url"] = False
     await update.message.reply_text(
-        "Send a KukuFM /show/<slug> URL. Permitted episodes will be processed "
-        "as M4A audio and sent here."
+        "Welcome to HB Audio Uploader.\n\n"
+        "Commands:\n"
+        "/HB - Start a new show job\n"
+        "/pause - Pause current job\n"
+        "/resume - Resume paused job\n"
+        "/stop - Stop current job"
     )
 
 
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    url = (message.text or "").strip()
-    workdir = tempfile.mkdtemp(prefix="kuku_")
-    status = await message.reply_text("Checking series…")
+async def hb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    uid = update.effective_user.id
+    active = jobs.get(uid)
+    if active and not active.get("stopped"):
+        await update.message.reply_text("A job is already active. Use /stop first.")
+        return
+    context.user_data["awaiting_show_url"] = True
+    await update.message.reply_text(
+        "Enter show URL:\nhttps://kukufm.com/show/<show-slug>"
+    )
+
+
+async def pause(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    job = jobs.get(update.effective_user.id)
+    if not job or job.get("stopped"):
+        await update.message.reply_text("No active job.")
+        return
+    job["paused"] = True
+    await update.message.reply_text("⏸ Job paused. Use /resume to continue.")
+
+
+async def resume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    job = jobs.get(update.effective_user.id)
+    if not job or job.get("stopped"):
+        await update.message.reply_text("No paused job.")
+        return
+    job["paused"] = False
+    await update.message.reply_text("▶️ Job resumed.")
+
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    job = jobs.get(update.effective_user.id)
+    context.user_data["awaiting_show_url"] = False
+    if not job or job.get("stopped"):
+        await update.message.reply_text("No active job.")
+        return
+    job["stopped"] = True
+    job["paused"] = False
+    await update.message.reply_text("⏹ Stop requested. Current step will finish, then the job will stop.")
+
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not allowed(update):
+        return
+    if not context.user_data.get("awaiting_show_url"):
+        await update.message.reply_text("Use /HB first.")
+        return
+
+    url = (update.message.text or "").strip()
+    try:
+        slug = get_show_slug(url)
+    except ValueError as exc:
+        await update.message.reply_text(f"❌ {exc}")
+        return
+
+    context.user_data["awaiting_show_url"] = False
+    uid = update.effective_user.id
+    jobs[uid] = {"paused": False, "stopped": False}
+    asyncio.create_task(process_show(update, uid, slug))
+
+
+async def process_show(update, uid, slug):
+    job = jobs[uid]
+    workdir = Path(tempfile.mkdtemp(prefix="hb_"))
+    status = await update.message.reply_text("🔎 Reading show details…")
 
     try:
-        show_slug = get_show_id(url)
-        episodes = await asyncio.to_thread(get_all_episodes, show_slug)
+        show = await asyncio.to_thread(get_show_info, slug)
+        episodes = await asyncio.to_thread(get_all_episodes, slug)
+        show_name = show["name"]
 
         if not episodes:
-            await status.edit_text("No episodes were found.")
+            await status.edit_text("❌ No episodes found.")
             return
 
+        poster = None
+        try:
+            poster = await asyncio.to_thread(download_poster, show.get("poster_url"), workdir)
+        except Exception:
+            logging.exception("Poster download failed")
+
         total = len(episodes)
-        await status.edit_text(f"Found {total} episodes. Starting M4A processing…")
+        await status.edit_text(f"🎧 {show_name}\nEpisodes: {total}\nStarting…")
 
         sent = 0
-        skipped = 0
+        failed = 0
 
         for position, episode in enumerate(episodes, start=1):
-            title = str(episode.get("title") or f"Episode {position}")
+            while job["paused"] and not job["stopped"]:
+                await asyncio.sleep(1)
+            if job["stopped"]:
+                break
+
+            ep_no = int(episode.get("index") or position)
+            ep_name = str(episode.get("title") or f"Episode {ep_no}")
+
             try:
                 await status.edit_text(
-                    f"Processing {position}/{total}\n{title}"
+                    f"⬇️ Processing {position}/{total}\n{ep_name}"
                 )
-                path = await asyncio.to_thread(download_episode, episode, workdir)
+                audio_path = await asyncio.to_thread(
+                    download_episode, episode, workdir, poster
+                )
 
-                try:
-                    with path.open("rb") as audio_file:
-                        await message.reply_audio(
-                            audio=audio_file,
-                            title=title,
-                            filename=path.name,
-                            caption=f"{position}/{total} • {title}",
-                            read_timeout=300,
-                            write_timeout=300,
+                caption = (
+                    f"🎧 <b>“{html.escape(show_name)}”</b>\n\n"
+                    f"🎙 <b>Episode {ep_no}</b>\n"
+                    f"📖 {html.escape(ep_name)}"
+                )
+
+                with audio_path.open("rb") as audio:
+                    thumb = poster.open("rb") if poster and poster.exists() else None
+                    try:
+                        await update.get_bot().send_audio(
+                            chat_id=TARGET_CHANNEL,
+                            audio=audio,
+                            thumbnail=thumb,
+                            title=ep_name,
+                            performer=show_name,
+                            caption=caption,
+                            parse_mode=ParseMode.HTML,
+                            read_timeout=600,
+                            write_timeout=600,
                             connect_timeout=60,
                             pool_timeout=60,
                         )
-                    sent += 1
-                finally:
-                    path.unlink(missing_ok=True)
+                    finally:
+                        if thumb:
+                            thumb.close()
+
+                sent += 1
+                audio_path.unlink(missing_ok=True)
+                await status.edit_text(
+                    f"⬆️ Uploaded {sent}/{total}\n{ep_name}"
+                )
 
             except TelegramError as exc:
-                logging.exception("Telegram upload failed")
-                skipped += 1
-                logging.warning("Upload skipped for %s: %s", title, exc)
+                failed += 1
+                logging.exception("Telegram upload failed: %s", exc)
             except Exception as exc:
-                logging.exception("Episode processing failed")
-                skipped += 1
-                logging.warning("Episode skipped: %s", exc)
+                failed += 1
+                logging.exception("Episode failed: %s", exc)
 
-        await status.edit_text(
-            f"Finished. Sent: {sent}/{total}. Failed/skipped: {skipped}."
-        )
-
-    except ValueError as exc:
-        await status.edit_text(str(exc))
+        if job["stopped"]:
+            await status.edit_text(
+                f"⏹ Stopped. Uploaded: {sent} | Failed: {failed}"
+            )
+        else:
+            await status.edit_text(
+                f"✅ Completed. Uploaded: {sent}/{total} | Failed: {failed}"
+            )
     except Exception as exc:
-        logging.exception("Job failed")
-        await status.edit_text(f"Error: {exc}")
+        logging.exception("Show job failed")
+        await status.edit_text(f"❌ Error: {exc}")
     finally:
+        job["stopped"] = True
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+async def post_init(app):
+    await app.bot.set_my_commands([
+        BotCommand("start", "Welcome and commands"),
+        BotCommand("HB", "Start show download/upload"),
+        BotCommand("pause", "Pause current job"),
+        BotCommand("resume", "Resume paused job"),
+        BotCommand("stop", "Stop current job"),
+    ])
+
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+    app.add_handler(CommandHandler("HB", hb))
+    app.add_handler(CommandHandler("pause", pause))
+    app.add_handler(CommandHandler("resume", resume))
+    app.add_handler(CommandHandler("stop", stop))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling(drop_pending_updates=True)
 
 
