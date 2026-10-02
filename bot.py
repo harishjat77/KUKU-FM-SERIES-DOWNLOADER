@@ -8,7 +8,7 @@ from pathlib import Path
 
 from telegram import BotCommand, Update
 from telegram.constants import ParseMode
-from telegram.error import TelegramError
+from telegram.error import Conflict, NetworkError, TelegramError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -29,6 +29,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO,
 )
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 TARGET_CHANNEL = os.environ["TARGET_CHANNEL"]
@@ -180,7 +181,6 @@ async def process_show(update: Update, uid: int, slug: str):
                     download_episode, episode, workdir, poster
                 )
 
-                # Caption: show name bold + quotes, episode number + name
                 caption = (
                     f"🎧 <b>“{html.escape(show_name)}”</b>\n\n"
                     f"🎙 <b>Episode {ep_no}</b>\n"
@@ -240,8 +240,24 @@ async def process_show(update: Update, uid: int, slug: str):
         shutil.rmtree(workdir, ignore_errors=True)
 
 
-async def post_init(app):
-    # Telegram requires command names to be lowercase only
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    err = context.error
+    if isinstance(err, Conflict):
+        # Another getUpdates is running with the same token.
+        logger.warning(
+            "Polling conflict: another bot instance is using this token. "
+            "Stop all other instances (local PC, old Render service, webhook)."
+        )
+        return
+    if isinstance(err, (NetworkError, TimedOut)):
+        logger.warning("Network issue: %s", err)
+        return
+    logger.exception("Unhandled error: %s", err)
+
+
+async def post_init(app: Application):
+    # Ensure no webhook is set (webhook + polling = conflict)
+    await app.bot.delete_webhook(drop_pending_updates=True)
     await app.bot.set_my_commands(
         [
             BotCommand("start", "Welcome and commands"),
@@ -251,6 +267,7 @@ async def post_init(app):
             BotCommand("stop", "Stop current job"),
         ]
     )
+    logger.info("Bot started. Webhook cleared. Commands registered.")
 
 
 def main():
@@ -261,7 +278,6 @@ def main():
         .build()
     )
     app.add_handler(CommandHandler("start", start))
-    # Accept both /hb and /HB (Telegram normalizes; handler is case-insensitive)
     app.add_handler(CommandHandler(["hb", "HB"], hb))
     app.add_handler(CommandHandler("pause", pause))
     app.add_handler(CommandHandler("resume", resume))
@@ -269,7 +285,11 @@ def main():
     app.add_handler(
         MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text)
     )
-    app.run_polling(drop_pending_updates=True)
+    app.add_error_handler(error_handler)
+    app.run_polling(
+        drop_pending_updates=True,
+        allowed_updates=Update.ALL_TYPES,
+    )
 
 
 if __name__ == "__main__":
