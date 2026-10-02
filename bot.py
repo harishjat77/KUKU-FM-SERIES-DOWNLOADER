@@ -48,6 +48,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
     context.user_data["awaiting_show_url"] = False
+    context.user_data["awaiting_start_episode"] = False
+    context.user_data.pop("pending_show_slug", None)
     await update.message.reply_text(
         "👋 Welcome to HB Audio Uploader!\n\n"
         "Available commands:\n"
@@ -70,6 +72,8 @@ async def hb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     context.user_data["awaiting_show_url"] = True
+    context.user_data["awaiting_start_episode"] = False
+    context.user_data.pop("pending_show_slug", None)
     await update.message.reply_text(
         "Enter show URL:\n"
         "https://kukufm.com/show/<show-slug>\n\n"
@@ -104,6 +108,8 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     job = jobs.get(update.effective_user.id)
     context.user_data["awaiting_show_url"] = False
+    context.user_data["awaiting_start_episode"] = False
+    context.user_data.pop("pending_show_slug", None)
     if not job or job.get("stopped"):
         await update.message.reply_text("No active job.")
         return
@@ -117,24 +123,59 @@ async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed(update):
         return
-    if not context.user_data.get("awaiting_show_url"):
-        await update.message.reply_text("Use /hb first.")
+
+    text = (update.message.text or "").strip()
+
+    if context.user_data.get("awaiting_show_url"):
+        try:
+            slug = get_show_slug(text)
+        except ValueError as exc:
+            await update.message.reply_text(f"❌ {exc}")
+            return
+
+        context.user_data["awaiting_show_url"] = False
+        context.user_data["awaiting_start_episode"] = True
+        context.user_data["pending_show_slug"] = slug
+        await update.message.reply_text(
+            "🔢 Enter starting episode number:\n\n"
+            "Example: send <b>1</b> to start from the beginning, "
+            "or <b>35</b> to resume from Episode 35.",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
-    url = (update.message.text or "").strip()
-    try:
-        slug = get_show_slug(url)
-    except ValueError as exc:
-        await update.message.reply_text(f"❌ {exc}")
+    if context.user_data.get("awaiting_start_episode"):
+        try:
+            start_episode = int(text)
+            if start_episode < 1:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Please send a valid episode number, for example: 1 or 35."
+            )
+            return
+
+        slug = context.user_data.get("pending_show_slug")
+        if not slug:
+            context.user_data["awaiting_start_episode"] = False
+            await update.message.reply_text("❌ Show session expired. Use /hb again.")
+            return
+
+        context.user_data["awaiting_start_episode"] = False
+        context.user_data.pop("pending_show_slug", None)
+        uid = update.effective_user.id
+        jobs[uid] = {
+            "paused": False,
+            "stopped": False,
+            "start_episode": start_episode,
+        }
+        asyncio.create_task(process_show(update, uid, slug, start_episode))
         return
 
-    context.user_data["awaiting_show_url"] = False
-    uid = update.effective_user.id
-    jobs[uid] = {"paused": False, "stopped": False}
-    asyncio.create_task(process_show(update, uid, slug))
+    await update.message.reply_text("Use /hb first.")
 
 
-async def process_show(update: Update, uid: int, slug: str):
+async def process_show(update: Update, uid: int, slug: str, start_episode: int = 1):
     job = jobs[uid]
     workdir = Path(tempfile.mkdtemp(prefix="hb_"))
     status = await update.message.reply_text("🔎 Reading show details…")
@@ -148,6 +189,20 @@ async def process_show(update: Update, uid: int, slug: str):
             await status.edit_text("❌ No episodes found.")
             return
 
+        total = len(episodes)
+        selected_episodes = []
+        for position, episode in enumerate(episodes, start=1):
+            ep_no = int(episode.get("index") or position)
+            if ep_no >= start_episode:
+                selected_episodes.append((position, episode, ep_no))
+
+        if not selected_episodes:
+            await status.edit_text(
+                f"❌ Episode {start_episode} is outside this show. "
+                f"Total episodes: {total}."
+            )
+            return
+
         poster = None
         try:
             poster = await asyncio.to_thread(
@@ -156,12 +211,11 @@ async def process_show(update: Update, uid: int, slug: str):
         except Exception:
             logging.exception("Poster download failed")
 
-        total = len(episodes)
-
         # Publish show details before any episode and pin them in the channel.
         show_header = (
             f"🎧 <b>{html.escape(show_name)}</b>\n"
             f"📚 <b>Total Episodes:</b> {total}\n"
+            f"▶️ <b>Starting From:</b> Episode {start_episode}\n"
             f"⏳ <b>Status:</b> Download & Upload Started"
         )
         try:
@@ -179,24 +233,28 @@ async def process_show(update: Update, uid: int, slug: str):
             logger.warning("Could not send/pin show header: %s", exc)
 
         await status.edit_text(
-            f"🎧 {html.escape(show_name)}\nEpisodes: {total}\nStarting…"
+            f"🎧 {html.escape(show_name)}\n"
+            f"Episodes: {total}\nStarting from Episode {start_episode}…"
         )
 
         sent = 0
         failed = 0
+        selected_total = len(selected_episodes)
 
-        for position, episode in enumerate(episodes, start=1):
+        for progress, (position, episode, ep_no) in enumerate(
+            selected_episodes, start=1
+        ):
             while job["paused"] and not job["stopped"]:
                 await asyncio.sleep(1)
             if job["stopped"]:
                 break
 
-            ep_no = int(episode.get("index") or position)
             ep_name = str(episode.get("title") or f"Episode {ep_no}")
 
             try:
                 await status.edit_text(
-                    f"⬇️ Processing {position}/{total}\n{ep_name}"
+                    f"⬇️ Processing {progress}/{selected_total}\n"
+                    f"Episode {ep_no}: {ep_name}"
                 )
                 audio_path = await asyncio.to_thread(
                     download_episode, episode, workdir, poster
@@ -235,7 +293,8 @@ async def process_show(update: Update, uid: int, slug: str):
                 sent += 1
                 audio_path.unlink(missing_ok=True)
                 await status.edit_text(
-                    f"⬆️ Uploaded {sent}/{total}\n{ep_name}"
+                    f"⬆️ Uploaded {sent}/{selected_total}\n"
+                    f"Episode {ep_no}: {ep_name}"
                 )
 
             except TelegramError as exc:
@@ -251,7 +310,7 @@ async def process_show(update: Update, uid: int, slug: str):
             )
         else:
             await status.edit_text(
-                f"✅ Completed. Uploaded: {sent}/{total} | Failed: {failed}"
+                f"✅ Completed. Uploaded: {sent}/{selected_total} | Failed: {failed}"
             )
     except Exception as exc:
         logging.exception("Show job failed")
